@@ -62,34 +62,70 @@ st.sidebar.caption(f'Last observed: {last_month:%B %Y}  |  Forecast: {forecast_m
 st.sidebar.caption(f'Model trained through: {metadata.get("training_end", "2018-12")}')
 st.sidebar.info('The model was fitted on data before 2019. Its January 2021 forecast uses observed lag values through December 2020.')
 
-history = df.loc[df.City == city].sort_values('Date')
-v = history.Value.to_numpy(dtype=float)
-if len(v) < 12:
-    st.error('At least 12 months of history are required.')
+history = df.loc[df.City == city].sort_values('Date').copy()
+if len(history) < 12:
+    st.error('At least 12 consecutive months of historical observations are required.')
     st.stop()
-row = {'City':city, 'Date':forecast_month,
-       'month_sin':np.sin(2*np.pi*forecast_month.month/12),
-       'month_cos':np.cos(2*np.pi*forecast_month.month/12)}
+expected = pd.date_range(history.Date.min(), history.Date.max(), freq='MS')
+if not history.Date.reset_index(drop=True).equals(pd.Series(expected)):
+    st.error('Incomplete monthly city history; cannot construct consistent lag features.')
+    st.stop()
+
+st.subheader('Interactive NGBoost prediction')
+st.caption('Historical one-month-ahead scenario. Change December 2020 cases to explore how the January 2021 prediction responds. Other earlier months remain observed.')
+observed_last = float(history.Value.iloc[-1])
+with st.form('interactive_forecast'):
+    input_city = st.text_input('Selected location', value=city, disabled=True)
+    input_month = st.text_input('Forecast month', value=f'{forecast_month:%Y-%m}', disabled=True)
+    edited_last = st.number_input(
+        f'Dengue cases in {last_month:%B %Y} (previous month)',
+        min_value=0, max_value=1000000,
+        value=int(observed_last), step=1,
+        help='Overrides only the latest observed month for this scenario; older historical observations are unchanged.'
+    )
+    submitted = st.form_submit_button('Predict dengue cases', type='primary')
+
+# Streamlit reruns on form submission. All features are recomputed from the same
+# scenario history, using only observations prior to the forecast month.
+scenario = history.copy()
+scenario.loc[scenario.index[-1], 'Value'] = float(edited_last)
+v = scenario.Value.to_numpy(dtype=float)
+assert scenario.Date.max() == last_month
+assert forecast_month == last_month + pd.DateOffset(months=1)
+assert np.isfinite(v).all() and (v >= 0).all()
+row = {'City': city, 'Date': forecast_month,
+       'month_sin': np.sin(2*np.pi*forecast_month.month/12),
+       'month_cos': np.cos(2*np.pi*forecast_month.month/12)}
 for lag in (1,2,3,6,12):
-    row[f'lag_{lag}'] = v[-lag]
+    row[f'lag_{lag}'] = float(v[-lag])
 for w in (3,6,12):
-    row[f'rolling_mean_{w}'] = v[-w:].mean()
-    row[f'rolling_std_{w}'] = v[-w:].std(ddof=0)
-row['recent_change'] = v[-1]-v[-2]
+    row[f'rolling_mean_{w}'] = float(v[-w:].mean())
+    row[f'rolling_std_{w}'] = float(v[-w:].std(ddof=0))
+row['recent_change'] = float(v[-1]-v[-2])
 features = bundle['features']
 inputs = pd.DataFrame([row])
+if any(f not in inputs.columns for f in features):
+    st.error('The exported model requests an unsupported feature. Verify its metadata.')
+    st.stop()
 try:
-    dist = bundle['model'].pred_dist(bundle['preprocessor'].transform(inputs[features]))
+    transformed = bundle['preprocessor'].transform(inputs[features])
+    dist = bundle['model'].pred_dist(transformed)
     mu = float(np.asarray(dist.loc).reshape(-1)[0])
     sigma = float(np.asarray(dist.scale).reshape(-1)[0])
+    if not (np.isfinite(mu) and np.isfinite(sigma) and sigma >= 0):
+        raise ValueError('NGBoost returned invalid distribution parameters')
     point = max(0.0, float(np.expm1(mu)))
     lower = max(0.0, float(np.expm1(mu + norm.ppf(.05)*sigma)))
     upper = max(0.0, float(np.expm1(mu + norm.ppf(.95)*sigma)))
 except Exception as exc:
-    st.error('Prediction failed. Confirm the exported bundle and installed dependency versions match the Colab training environment.')
+    st.error('Prediction failed. Confirm the exported bundle and installed dependency versions match Colab.')
     st.exception(exc)
     st.stop()
 
+if edited_last != observed_last:
+    st.info(f'Scenario: {last_month:%B %Y} changed from {observed_last:,.0f} to {edited_last:,.0f} cases. The lag and rolling features below were recalculated. This is a what-if scenario, not a validated causal intervention.')
+else:
+    st.caption('Using the original recorded previous-month value. Change it and click Predict dengue cases to explore a scenario.')
 st.subheader(f'{city} — {forecast_month:%B %Y} historical forecast')
 a,b,c,d = st.columns(4)
 a.metric('NGBoost median prediction', f'{point:,.0f}')
@@ -97,6 +133,8 @@ b.metric('Previous-month baseline', f'{v[-1]:,.0f}')
 c.metric('Nominal 90% lower', f'{lower:,.0f}')
 d.metric('Nominal 90% upper', f'{upper:,.0f}')
 st.caption('Predictions rounded for display. Interval is model-based, not calibrated to 90% observed coverage.')
+with st.expander('Show features sent to NGBoost'):
+    st.dataframe(inputs[features].T.rename(columns={0: 'Input value'}), use_container_width=True)
 
 st.subheader('Recorded dengue cases')
 fig=go.Figure()
@@ -122,18 +160,27 @@ if eval_file.is_file():
 else:
     st.info('Optional: add dengue_ngboost_historical_predictions.csv to display the historical comparison graph.')
 
-st.subheader('Model explainability — permutation importance')
-st.caption('Measured on 2018 validation data. Positive values indicate higher MAE after shuffling; negative values indicate lower MAE after shuffling. This is not causal evidence.')
-imp_file=ROOT/'dengue_ngboost_permutation_importance.csv'
-if imp_file.is_file():
-    imp=pd.read_csv(imp_file)
-    if {'Feature','MAE increase'}.issubset(imp.columns):
-        imp=imp.sort_values('MAE increase')
-        bar=go.Figure(go.Bar(x=imp['MAE increase'],y=imp.Feature,orientation='h'))
-        bar.update_layout(xaxis_title='Change in validation MAE (cases)',height=390)
-        st.plotly_chart(bar,use_container_width=True)
+st.subheader('Model explainability — 2018 validation')
+st.caption('Permutation importance from the completed NGBoost Colab experiment. Values are recorded results, not recomputed by this dashboard. Positive values mean shuffling increased MAE; negative values mean shuffling decreased MAE. Not causal evidence.')
+importance_file = ROOT/'dengue_ngboost_permutation_importance.csv'
+if importance_file.is_file():
+    importance = pd.read_csv(importance_file)
+    if not {'Feature','MAE increase'}.issubset(importance.columns):
+        st.error('Importance CSV is missing Feature or MAE increase columns.')
+        st.stop()
+    importance = importance.sort_values('MAE increase', ascending=False)
 else:
-    st.info('Optional: upload dengue_ngboost_permutation_importance.csv from Section 8 to show the importance chart.')
+    st.caption('Displaying previously recorded validation importance results (optional CSV not present).')
+    importance = pd.DataFrame([
+        ('lag_1', 124.819), ('month_cos', 11.560), ('month_sin', 5.000),
+        ('City', 1.694), ('lag_3', 0.854), ('rolling_mean_6', -4.441),
+        ('lag_12', -4.735), ('rolling_mean_3', -5.350)
+    ], columns=['Feature', 'MAE increase'])
+bar = go.Figure(go.Bar(x=importance['MAE increase'], y=importance['Feature'], orientation='h'))
+bar.update_layout(xaxis_title='Change in validation MAE (cases)', height=390, yaxis=dict(autorange='reversed'))
+st.plotly_chart(bar, use_container_width=True)
+with st.expander('View permutation importance values'):
+    st.dataframe(importance, hide_index=True)
 
 with st.expander('Model details and limitations'):
     st.json(metadata)
