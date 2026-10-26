@@ -1,0 +1,26 @@
+{
+  "algorithm": "NGBoost",
+  "features": [
+    "City",
+    "month_sin",
+    "month_cos",
+    "lag_1",
+    "lag_3",
+    "lag_12",
+    "rolling_mean_3",
+    "rolling_mean_6"
+  ],
+  "selected_config": {
+    "feature_set": "basic",
+    "depth": 3,
+    "min_leaf": 10,
+    "learning_rate": 0.03,
+    "n_estimators": 250
+  },
+  "training_end": "2018-12",
+  "historical_evaluation": "2019-2020 (previously viewed, not blind)",
+  "forecast_month": "2021-01-01",
+  "target_transform": "log1p",
+  "point_prediction": "inverse-transformed log-scale median",
+  "interval": "Normal quantiles on log1p scale; nominal 90%"
+}
